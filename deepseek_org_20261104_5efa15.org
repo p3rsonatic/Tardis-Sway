@@ -1,0 +1,1416 @@
+#+TITLE: TARDIS Sway — Literate Installer
+#+AUTHOR: you + Claude
+#+PROPERTY: header-args:bash :tangle install.sh :tangle-mode (identity #o755) :comments no
+
+* How to use and edit this file
+
+  This file tangles into a single =install.sh= that installs the
+  TARDIS-blue Sway desktop. Each heading below is a *module*: one
+  self-contained concern.
+
+  **Contract for edits.** When you ask for a change, only ONE module is
+  replaced. You receive: the module's number + name, and the new
+  =#+BEGIN_SRC= block. Nothing else in this file changes. That is how
+  we avoid "fixed the resize, broke the bar" regressions.
+
+  **Tangle and run.**
+
+  #+BEGIN_EXAMPLE
+    emacs --batch install.org -f org-babel-tangle
+    # or: C-c C-v t  (in Emacs)
+    chmod +x install.sh   # only if Emacs didn't already
+    ./install.sh
+  #+END_EXAMPLE
+
+  **Verify before running.**
+
+  #+BEGIN_EXAMPLE
+    bash -n install.sh    # syntax check; must be silent
+    grep -c '__[A-Z_]*__' install.sh   # placeholders remaining; expect 0
+  #+END_EXAMPLE
+
+  **Ordering invariants (do not reshuffle).**
+
+  - Module 1 defines =log=, =warn=, =fail=, =DOTFILES=, =LOG=. Every
+    later module depends on these.
+  - Module 23 (polkit binary) must run *after* Module 8 wrote the sway
+    config, because it substitutes =__POLKIT__= inside it.
+  - Module 26 (verification) must be the last thing before the final
+    message. It is the hard gate.
+
+* Module 1 — Header, globals, helpers, pre-flight, keyboard detection
+  :PROPERTIES:
+  :CUSTOM_ID: m1-header
+  :END:
+
+  Shebang, strict mode, global paths, the three logging helpers, and
+  the root/sudo guard. Truncates the install log so re-runs get a
+  fresh file. Detects the X11 keyboard layout so Module 8 can bake it
+  into the sway config — no placeholders, no `[XKB-338]` risk.
+
+  **Override** if auto-detection is wrong:
+  #+BEGIN_EXAMPLE
+    FORCE_LAYOUT=1 XKB_LAYOUT_OVERRIDE=br XKB_VARIANT_OVERRIDE=abnt2 ./install.sh
+  #+END_EXAMPLE
+
+#+NAME: m1-header
+#+BEGIN_SRC bash
+#!/usr/bin/env bash
+# install.sh — one-shot installer for the TARDIS-blue Sway desktop.
+# Generated from install.org by org-babel-tangle. Edit install.org, not this.
+# Tested on Debian 12, LMDE 6, Ubuntu 24.04.
+set -euo pipefail
+
+DOTFILES="$HOME/dotfiles"
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
+LOCALBIN="$HOME/.local/bin"
+LOG="$HOME/.dotfiles-install.log"
+
+log()  { printf '\033[1;38;5;33m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m!!!\033[0m %s\n' "$*"; }
+fail() { printf '\033[1;31mXXX\033[0m %s\n' "$*" >&2; exit 1; }
+
+[ "$EUID" -eq 0 ] && fail "Do not run as root."
+sudo -v || fail "sudo required."
+: > "$LOG"
+
+# ── Keyboard detection ───────────────────────────────────────────────
+# Order of preference: explicit override → /etc/default/keyboard
+# (what Cinnamon's keyboard settings and localectl write to) → localectl
+# → "us". Sanitized so a stray space can't break sway's parser.
+XKB_LAYOUT="us"
+XKB_VARIANT=""
+KB_SRC="default"
+if [ "${FORCE_LAYOUT:-0}" = "1" ] && [ -n "${XKB_LAYOUT_OVERRIDE:-}" ]; then
+  XKB_LAYOUT="$XKB_LAYOUT_OVERRIDE"
+  XKB_VARIANT="${XKB_VARIANT_OVERRIDE:-}"
+  KB_SRC="env override"
+elif [ -f /etc/default/keyboard ]; then
+  # shellcheck disable=SC1091
+  . /etc/default/keyboard 2>/dev/null || true
+  XKB_LAYOUT="${XKBLAYOUT:-us}"
+  XKB_VARIANT="${XKBVARIANT:-}"
+  KB_SRC="/etc/default/keyboard"
+elif command -v localectl >/dev/null 2>&1; then
+  XKB_LAYOUT=$(localectl status 2>/dev/null | awk -F: '/X11 Layout/ {gsub(/ /,"",$2); print $2}' | cut -d, -f1)
+  XKB_VARIANT=$(localectl status 2>/dev/null | awk -F: '/X11 Variant/ {gsub(/ /,"",$2); print $2}' | cut -d, -f1)
+  KB_SRC="localectl"
+fi
+XKB_LAYOUT=$(printf '%s' "${XKB_LAYOUT:-us}" | tr -d '[:space:]')
+XKB_VARIANT=$(printf '%s' "${XKB_VARIANT:-}" | tr -d '[:space:]')
+[ -z "$XKB_LAYOUT" ] && XKB_LAYOUT="us"
+log "Keyboard: layout='$XKB_LAYOUT' variant='${XKB_VARIANT:-<none>}' (source: $KB_SRC)"
+
+#+END_SRC
+
+* Module 2 — Repair half-configured dpkg state
+  :PROPERTIES:
+  :CUSTOM_ID: m2-dpkg
+  :END:
+
+  A failing unrelated package (e.g. =virtualbox-dkms=) leaves dpkg in
+  "half-configured" state, which makes every subsequent =apt install=
+  abort with exit 11. Attempt recovery; do not fail if recovery fails
+  — Module 5's critical-package gate is the real safety net.
+
+#+NAME: m2-dpkg
+#+BEGIN_SRC bash
+log "Checking dpkg state…"
+if [ -z "$(sudo dpkg --audit 2>/dev/null)" ]; then
+  log "dpkg state OK."
+else
+  warn "dpkg has half-configured packages; attempting recovery…"
+  sudo dpkg --configure -a >>"$LOG" 2>&1 \
+    || warn "dpkg --configure -a failed (see $LOG). Continuing anyway."
+fi
+
+#+END_SRC
+
+* Module 3 — Detect polkit agent package
+  :PROPERTIES:
+  :CUSTOM_ID: m3-polkit-pkg
+  :END:
+
+  =polkit-gnome= is absent from Debian 12 and Ubuntu 24.04.
+  =lxpolkit= is the lightest working agent; =mate-polkit= is fallback.
+  Aborts if neither is available — there is no acceptable "no polkit"
+  outcome for a shared desktop.
+
+#+NAME: m3-polkit-pkg
+#+BEGIN_SRC bash
+sudo apt-get update -qq >>"$LOG" 2>&1 || warn "apt update returned non-zero."
+
+POLKIT_PKG=""
+for p in lxpolkit mate-polkit; do
+  if apt-cache show "$p" >/dev/null 2>&1; then
+    POLKIT_PKG="$p"
+    break
+  fi
+done
+[ -z "$POLKIT_PKG" ] && fail "No polkit agent in apt (tried lxpolkit, mate-polkit)."
+log "Polkit package: $POLKIT_PKG"
+
+#+END_SRC
+
+* Module 4 — Package lists (required, critical, optional)
+  :PROPERTIES:
+  :CUSTOM_ID: m4-package-lists
+  :END:
+
+  Three arrays:
+  - =PKGS= — everything =apt install= is asked to install
+  - =CRITICAL= — subset verified *by dpkg-query* after install; missing
+    one of these aborts the script
+  - =OPTIONAL= — installed one-by-one with warnings, never abort
+
+  **New since v1:** =blueman= (GUI Bluetooth manager — the primary BT
+  surface, per user request) and =power-profiles-daemon= (backing the
+  new power-profile toggle on the bar). Both are in =CRITICAL= — the
+  desktop must not install without them.
+
+#+NAME: m4-package-lists
+#+BEGIN_SRC bash
+PKGS=(
+  sway swaybg swayidle swaylock
+  waybar mako-notifier wofi foot
+  grim slurp wl-clipboard wf-recorder cliphist
+  xdg-desktop-portal-wlr xdg-desktop-portal-gtk
+  pipewire wireplumber pipewire-pulse pulsemixer playerctl
+  network-manager bluez
+  blueman
+  power-profiles-daemon
+  gammastep brightnessctl wlogout kanshi
+  gnome-keyring udiskie
+  "$POLKIT_PKG"
+  micro fd-find qalc btop ncdu nnn
+  fonts-font-awesome fonts-jetbrains-mono fonts-noto-color-emoji
+  jq curl unzip python3
+)
+
+CRITICAL=(
+  sway waybar foot wofi mako-notifier
+  "$POLKIT_PKG"
+  blueman power-profiles-daemon
+  nnn jq pipewire wireplumber
+  network-manager brightnessctl pulsemixer
+  grim slurp wl-clipboard wf-recorder cliphist
+  gammastep wlogout kanshi
+  fonts-jetbrains-mono
+)
+
+OPTIONAL=( )
+
+#+END_SRC
+
+* Module 5 — Install packages and verify
+  :PROPERTIES:
+  :CUSTOM_ID: m5-install
+  :END:
+
+  Attempts the whole =PKGS= list. On non-zero exit (often unrelated —
+  e.g. a failing =virtualbox-dkms=), run recovery, then verify each
+  =CRITICAL= package by =dpkg-query= — abort only if one of *those* is
+  missing.
+
+  Then installs =OPTIONAL= one-by-one with warnings.
+
+  **New since v1:** the final =systemctl enable --now bluetooth=
+  guarantees =bluetoothd= is running when the user opens
+  =blueman-manager=. Bluez's postinst usually enables it, but not
+  always on freshly-installed systems.
+
+#+NAME: m5-install
+#+BEGIN_SRC bash
+log "Installing required packages…"
+if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+     -o Dpkg::Options::=--force-confdef \
+     -o Dpkg::Options::=--force-confold \
+     "${PKGS[@]}" 2>&1 | tee -a "$LOG"; then
+  warn "apt-get install returned non-zero (may be unrelated to our packages)."
+  warn "Attempting recovery…"
+  sudo dpkg --configure -a >>"$LOG" 2>&1 || true
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y >>"$LOG" 2>&1 || true
+fi
+
+log "Verifying critical packages…"
+MISSING=()
+for p in "${CRITICAL[@]}"; do
+  if ! dpkg-query -W -f='${Status}' "$p" 2>/dev/null \
+       | grep -q '^install ok installed$'; then
+    MISSING+=("$p")
+  fi
+done
+if [ "${#MISSING[@]}" -gt 0 ]; then
+  warn "Missing critical packages: ${MISSING[*]}"
+  warn "Full log: $LOG"
+  fail "Cannot proceed without: ${MISSING[*]}"
+fi
+log "All critical packages verified."
+
+log "Installing optional packages (warnings only)…"
+for p in "${OPTIONAL[@]}"; do
+  if apt-cache show "$p" >/dev/null 2>&1; then
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$p" >>"$LOG" 2>&1 \
+      || warn "Could not install optional: $p"
+  else
+    warn "Not in this release: $p (skipped)"
+  fi
+done
+
+# Bluetooth daemon must be live for blueman-manager to see adapters.
+sudo systemctl enable --now bluetooth >/dev/null 2>&1 \
+  || warn "Could not enable bluetooth service; blueman may show no adapters until reboot."
+
+#+END_SRC
+
+* Module 6 — Third-party binaries (bluetuith, yazi)
+  :PROPERTIES:
+  :CUSTOM_ID: m6-binaries
+  :END:
+
+  Two tools not in apt. Both best-effort; never abort.
+  - =bluetuith= — BT TUI, falls back to =bluetoothctl= if fetch fails
+  - =yazi= — nicer file manager, falls back to =nnn= (already installed
+    as a *critical* package in Module 5, so "no file manager" is
+    impossible)
+
+#+NAME: m6-binaries
+#+BEGIN_SRC bash
+mkdir -p "$LOCALBIN"
+
+if ! command -v bluetuith >/dev/null 2>&1; then
+  case "$(dpkg --print-architecture)" in
+    amd64) BIN=bluetuith-linux-amd64 ;;
+    arm64) BIN=bluetuith-linux-arm64 ;;
+    *)     BIN="" ;;
+  esac
+  if [ -n "$BIN" ]; then
+    log "Fetching bluetuith…"
+    if curl -fsSL "https://github.com/bluetuith-org/bluetuith/releases/latest/download/$BIN" \
+         -o "$LOCALBIN/bluetuith"; then
+      chmod +x "$LOCALBIN/bluetuith"
+    else
+      warn "bluetuith fetch failed; Bluetooth falls back to bluetoothctl."
+    fi
+  fi
+fi
+
+if ! command -v yazi >/dev/null 2>&1; then
+  case "$(dpkg --print-architecture)" in
+    amd64) YZ=yazi-x86_64-unknown-linux-gnu.zip ;;
+    arm64) YZ=yazi-aarch64-unknown-linux-gnu.zip ;;
+    *)     YZ="" ;;
+  esac
+  if [ -n "$YZ" ]; then
+    log "Fetching yazi (optional upgrade over nnn)…"
+    tmp=$(mktemp -d)
+    if curl -fsSL "https://github.com/sxyazi/yazi/releases/latest/download/$YZ" \
+         -o "$tmp/yazi.zip" 2>/dev/null; then
+      unzip -qo "$tmp/yazi.zip" -d "$tmp" 2>/dev/null
+      find "$tmp" -type f -name yazi -exec install -m755 {} "$LOCALBIN/yazi" \; 2>/dev/null
+      find "$tmp" -type f -name ya   -exec install -m755 {} "$LOCALBIN/ya"   \; 2>/dev/null
+    fi
+    rm -rf "$tmp"
+    command -v yazi >/dev/null 2>&1 || warn "yazi fetch failed; using nnn."
+  fi
+fi
+
+#+END_SRC
+
+* Module 7 — Ensure ~/.local/bin on PATH
+  :PROPERTIES:
+  :CUSTOM_ID: m7-path
+  :END:
+
+  Idempotently appends to =~/.profile= and =~/.bashrc=; grep-gated so
+  re-running doesn't duplicate the export.
+
+#+NAME: m7-path
+#+BEGIN_SRC bash
+for RC in "$HOME/.profile" "$HOME/.bashrc"; do
+  [ -f "$RC" ] || continue
+  grep -q 'HOME/.local/bin' "$RC" \
+    || printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$RC"
+done
+
+#+END_SRC
+
+* Module 8 — Sway config
+  :PROPERTIES:
+  :CUSTOM_ID: m8-sway-config
+  :END:
+
+  Creates =~/dotfiles/sway/config=.
+
+  **Philosophy: do not touch sway.** Every focus / move / resize / split
+  / workspace / session bind is copied verbatim from Debian's stock
+  =/etc/sway/config=. TARDIS additions live on **unused keys only**.
+
+  **Workspaces 1–9.** Stock sway binds 1–5; extended to 9 for both
+  =workspace= (switch) and =move container to workspace= (send window).
+  Keys 6–9 work on any keyboard.
+
+  **Touchpad — physical buttons, not finger count.** =click_method
+  buttonareas=: bottom-right = right click, bottom-left = left click.
+  =middle_emulation enabled=: bottom-middle press = middle click.
+
+  **nmtui fix.** Not fullscreen (sway pins undersized fullscreen
+  surfaces top-left). Float at workspace size, launched through
+  =nmtui.sh= which sleeps 0.2 s before ncurses queries terminal size.
+
+  **Media keys restored.** Stock sway does not bind =XF86Audio*= or
+  =XF86MonBrightness*=; re-added here.
+
+  **Keyboard block is appended, not templated** (no placeholder risk).
+
+  **Invariant:** this module writes the file only. =__POLKIT__= is
+  resolved in Module 23.
+
+#+NAME: m8-sway-config
+#+BEGIN_SRC bash
+log "Writing dotfiles to $DOTFILES…"
+mkdir -p "$DOTFILES"/{sway,waybar,mako,foot,wofi,wlogout,gammastep,kanshi,wallpapers}
+
+cat > "$DOTFILES/sway/config" <<'SWAY_EOF'
+# Sway config — TARDIS blue
+# Stock sway/i3 binds are preserved verbatim (from /etc/sway/config).
+# TARDIS additions are on unused keys only, marked with a trailing comment.
+
+set $mod Mod4
+set $term foot
+set $menu wofi --show drun
+
+# ═════════════════════════════════════════════════════════════════════
+# STOCK SWAY BINDS — copied verbatim from /etc/sway/config
+# ═════════════════════════════════════════════════════════════════════
+
+# Terminal
+bindsym $mod+Return exec $term
+
+# Launcher
+bindsym $mod+d exec $menu
+
+# Kill focused window
+bindsym $mod+Shift+q kill
+
+# Drag floating windows with Super+left-mouse; resize with Super+right-mouse
+floating_modifier $mod normal
+
+# Reload the configuration file
+bindsym $mod+Shift+c reload
+
+# Exit sway (confirmation prompt)
+bindsym $mod+Shift+e exec swaynag -t warning -m 'You pressed the exit shortcut. Do you really want to exit sway? This will end your Wayland session.' -B 'Yes, exit sway' 'swaymsg exit'
+
+# Focus
+bindsym $mod+Left focus left
+bindsym $mod+Down focus down
+bindsym $mod+Up focus up
+bindsym $mod+Right focus right
+
+# Move window
+bindsym $mod+Shift+Left move left
+bindsym $mod+Shift+Down move down
+bindsym $mod+Shift+Up move up
+bindsym $mod+Shift+Right move right
+
+# Workspaces 1-9 (stock sway only ships 1-5; extended)
+bindsym $mod+1 workspace number 1
+bindsym $mod+2 workspace number 2
+bindsym $mod+3 workspace number 3
+bindsym $mod+4 workspace number 4
+bindsym $mod+5 workspace number 5
+bindsym $mod+6 workspace number 6
+bindsym $mod+7 workspace number 7
+bindsym $mod+8 workspace number 8
+bindsym $mod+9 workspace number 9
+
+# Move window to workspace 1-9
+bindsym $mod+Shift+1 move container to workspace number 1
+bindsym $mod+Shift+2 move container to workspace number 2
+bindsym $mod+Shift+3 move container to workspace number 3
+bindsym $mod+Shift+4 move container to workspace number 4
+bindsym $mod+Shift+5 move container to workspace number 5
+bindsym $mod+Shift+6 move container to workspace number 6
+bindsym $mod+Shift+7 move container to workspace number 7
+bindsym $mod+Shift+8 move container to workspace number 8
+bindsym $mod+Shift+9 move container to workspace number 9
+
+# Layout
+bindsym $mod+b splith
+bindsym $mod+v splitv
+bindsym $mod+s layout stacking
+bindsym $mod+w layout tabbed
+bindsym $mod+e layout toggle split
+bindsym $mod+f fullscreen
+
+# Float / focus mode
+bindsym $mod+Shift+space floating toggle
+bindsym $mod+space focus mode_toggle
+
+# Resize mode — enter with Super+R, use arrows, Enter/Esc exits
+mode "resize" {
+    bindsym Left resize shrink width 10 px or 10 ppt
+    bindsym Down resize grow height 10 px or 10 ppt
+    bindsym Up resize shrink height 10 px or 10 ppt
+    bindsym Right resize grow width 10 px or 10 ppt
+    bindsym Return mode "default"
+    bindsym Escape mode "default"
+    bindsym $mod+r mode "default"
+}
+bindsym $mod+r mode "resize"
+
+# ═════════════════════════════════════════════════════════════════════
+# TARDIS ADDITIONS — new binds on unused keys + exec lines only
+# ═════════════════════════════════════════════════════════════════════
+
+# Startup
+exec swaybg -i ~/wallpapers/current.ppm
+exec_always sh -c 'pkill -x waybar 2>/dev/null; sleep 0.2; exec waybar'
+exec mako
+exec __POLKIT__
+exec gnome-keyring-daemon --start --components=secrets
+exec udiskie --no-notify --tray=false
+exec swayidle -w \
+  timeout 600 'swaylock -f -c 0a1428' \
+  timeout 900 'swaymsg "output * dpms off"' \
+  resume 'swaymsg "output * dpms on"' \
+  before-sleep 'swaylock -f -c 0a1428'
+
+# Input — touchpad with physical button areas
+# click_method button_areas : bottom-right = right click, bottom-left = left
+# middle_emulation enabled : bottom-middle press = middle click
+input type:touchpad {
+  tap enabled
+  natural_scroll enabled
+  dwt enabled
+  click_method button_areas
+  middle_emulation enabled
+}
+
+# Appearance
+default_border pixel 2
+default_floating_border normal
+client.focused   #0F5CA8 #0F5CA8 #0a1428 #4A9FE0 #4A9FE0
+client.unfocused #0d1e33 #0d1e33 #8899bb #0d1e33 #0d1e33
+client.urgent    #f38ba8 #f38ba8 #0a1428 #f38ba8 #f38ba8
+
+for_window [window_type="dialog"] floating enable
+for_window [window_type="utility"] floating enable
+for_window [app_id="foot-tui"] floating enable, resize set 100 ppt 100 ppt
+for_window [app_id="foot-popup"] floating enable, resize set 500 450, move position center
+
+# nmtui: NOT fullscreen (sway pins undersized fullscreen surfaces top-left).
+# Float at workspace size; nmtui.sh sleeps 0.2s so foot processes the
+# resize before ncurses queries terminal dimensions.
+for_window [app_id="foot-nmtui"] floating enable, resize set 100 ppt 100 ppt, move position center
+
+# blueman: centered float so it reads like a dialog, not a tiled app
+for_window [app_id="blueman-manager"] floating enable, move position center
+
+# TARDIS launchers (all on keys unused by stock sway)
+bindsym $mod+a exec ~/.config/sway/launch.sh                # All tools
+bindsym $mod+slash exec ~/.config/sway/help.sh              # Show all shortcuts
+bindsym $mod+n exec ~/.config/sway/toggles.sh night         # Night light
+bindsym $mod+c exec ~/.config/sway/calendar.sh              # Calendar
+bindsym $mod+m exec foot --app-id=foot-tui -e pulsemixer    # Audio mixer
+bindsym Print exec ~/.config/sway/shot.sh                   # Screenshot
+bindsym $mod+Shift+r exec ~/.config/sway/rec.sh             # Record screen
+bindsym $mod+Shift+v exec ~/.config/sway/clip.sh            # Clipboard history
+bindsym $mod+Shift+w exec ~/.config/sway/nmtui.sh           # Network (nmtui)
+bindsym $mod+Shift+b exec blueman-manager                   # Bluetooth (GUI)
+bindsym $mod+Shift+f exec ~/.config/sway/files.sh           # Files
+
+# ── Media keys (stock sway does not bind these) ──────────────────────
+bindsym XF86AudioRaiseVolume  exec ~/.config/sway/vol.sh up
+bindsym XF86AudioLowerVolume  exec ~/.config/sway/vol.sh down
+bindsym XF86AudioMute         exec ~/.config/sway/vol.sh mute
+bindsym XF86MonBrightnessUp   exec ~/.config/sway/bright.sh up
+bindsym XF86MonBrightnessDown exec ~/.config/sway/bright.sh down
+bindsym XF86AudioPlay  exec playerctl play-pause
+bindsym XF86AudioNext  exec playerctl next
+bindsym XF86AudioPrev  exec playerctl previous
+SWAY_EOF
+
+{
+  echo ""
+  echo "# Keyboard layout (auto-detected by install.sh)"
+  echo "input type:keyboard {"
+  echo "  xkb_layout $XKB_LAYOUT"
+  [ -n "$XKB_VARIANT" ] && echo "  xkb_variant $XKB_VARIANT"
+  echo "}"
+} >> "$DOTFILES/sway/config"
+
+log "Keyboard written to sway config: xkb_layout $XKB_LAYOUT${XKB_VARIANT:+ xkb_variant $XKB_VARIANT}"
+#+END_SRC
+
+
+* Module 9 — Sway helper: help.sh
+  :PROPERTIES:
+  :CUSTOM_ID: m9-help
+  :END:
+
+  Parses the *live* =~/.config/sway/config= so the shortcut list can
+  never drift. **Searchable** (=wofi --dmenu= without =--insensitive=),
+  so typing "focus" or "resize" filters live.
+
+  Explicitly includes the resize-mode block (which lives inside
+  =mode "resize" { … }= and would otherwise be skipped by a naive
+  =^bindsym= grep), plus a one-line tip explaining that stock sway
+  resize is a *mode*, not a modifier combo.
+
+  The key column is rewritten so =$mod= / =Mod4= display as ="Super"= —
+  because the actual config uses =$mod= and that's what a newcomer needs
+  to see on the keyboard.
+
+#+NAME: m9-help
+#+BEGIN_SRC bash
+cat > "$DOTFILES/sway/help.sh" <<'HELP_EOF'
+#!/bin/sh
+CONFIG="$HOME/.config/sway/config"
+
+{
+  printf '\n'
+  printf '  TARDIS Sway — Keyboard Shortcuts\n'
+  printf '  ═══════════════════════════════════════════════════════════\n'
+  printf '\n'
+  printf '  Resize is a MODE: press Super+R, use arrows, Enter/Esc exits.\n'
+  printf '  Move/resize a floating window by mouse: Super + drag (or right-drag).\n'
+  printf '  Type in the search box to filter this list.\n'
+  printf '\n'
+  printf '  %-44s %s\n' "Action" "Shortcut"
+  printf '  %-44s %s\n' "────────────────────────────────────────────" "──────────────────"
+  printf '\n'
+
+  # All top-level bindsym lines, formatted and de-duplicated
+  grep -E '^bindsym ' "$CONFIG" \
+    | sed -E 's/^bindsym //' \
+    | awk '{
+        key = $1
+        rest = $0
+        sub(/^[^ ]+ /, "", rest)
+        if (match(rest, /#[^#]*$/)) {
+          desc = substr(rest, RSTART + 1)
+          sub(/^[[:space:]]+/, "", desc)
+        } else {
+          desc = rest
+        }
+        gsub(/Mod4/, "Super", key)
+        gsub(/\$mod/, "Super", key)
+        printf "  %-44s %s\n", desc, key
+      }' \
+    | sort -u
+
+  printf '\n'
+  printf '  %-44s %s\n' "── Resize mode (press Super+R first) ──" "──────────"
+  printf '  %-44s %s\n' "Shrink width"   "Left"
+  printf '  %-44s %s\n' "Grow width"     "Right"
+  printf '  %-44s %s\n' "Shrink height"  "Up"
+  printf '  %-44s %s\n' "Grow height"    "Down"
+  printf '  %-44s %s\n' "Exit resize mode" "Enter / Esc / Super+R"
+  printf '\n'
+} | wofi --dmenu --prompt "Shortcuts (type to filter)" --width 900 --height 600
+HELP_EOF
+#+END_SRC
+
+* Module 10 — Sway helper: files.sh
+  :PROPERTIES:
+  :CUSTOM_ID: m10-files
+  :END:
+
+  Prefers =yazi=; falls back to =nnn=. Both launch with
+  =--app-id=foot-tui= so the sway rule (Module 8) floats them fullsize.
+  =nnn= is guaranteed installed (Module 4 critical list).
+
+#+NAME: m10-files
+#+BEGIN_SRC bash
+cat > "$DOTFILES/sway/files.sh" <<'FILES_EOF'
+#!/bin/sh
+if command -v yazi >/dev/null 2>&1; then
+  exec foot --app-id=foot-tui -e yazi
+fi
+exec foot --app-id=foot-tui -e nnn -d
+FILES_EOF
+
+#+END_SRC
+
+* Module 11 — Sway helper: launch.sh ("All tools" menu)
+  :PROPERTIES:
+  :CUSTOM_ID: m11-launch
+  :END:
+
+  The front door for the whole TUI tier. =Super+A= opens this.
+
+  **Menu fix:** "Log out / power" now calls =~/.config/sway/menu.sh=,
+  not wlogout directly. wlogout can silently fail to render under some
+  sway/waybar/GTK-layer-shell combinations; menu.sh falls back cleanly.
+
+#+NAME: m11-launch
+#+BEGIN_SRC bash
+cat > "$DOTFILES/sway/launch.sh" <<'LAUNCH_EOF'
+#!/bin/sh
+TUI="foot --app-id=foot-tui"
+POPUP="foot --app-id=foot-popup"
+
+choice=$(printf '%s\n' \
+  "Apps            (wofi)" \
+  "Terminal        (foot)" \
+  "Files           (yazi / nnn)" \
+  "Network         (nmtui)" \
+  "Bluetooth       (blueman)" \
+  "Audio           (pulsemixer)" \
+  "Processes       (btop)" \
+  "Disk usage      (ncdu)" \
+  "Calendar        (ncal)" \
+  "Calculator      (qalc)" \
+  "Screenshot      (grim)" \
+  "Record screen   (wf-recorder)" \
+  "Clipboard       (cliphist)" \
+  "Help / keybinds" \
+  "Log out / power" \
+  | wofi --dmenu --prompt "All tools" --insensitive)
+
+case "$choice" in
+  Apps*)      wofi --show drun --insensitive ;;
+  Terminal*)  foot ;;
+  Files*)     ~/.config/sway/files.sh ;;
+  Network*)   ~/.config/sway/nmtui.sh ;;
+  Bluetooth*) blueman-manager ;;
+  Audio*)     $TUI -e pulsemixer ;;
+  Processes*) $TUI -e btop ;;
+  Disk*)      $TUI -e ncdu ~ ;;
+  Calendar*)  ~/.config/sway/calendar.sh ;;
+  Calc*)      $POPUP -e sh -c 'qalc; read _' ;;
+  Screenshot*)~/.config/sway/shot.sh ;;
+  Record*)    ~/.config/sway/rec.sh ;;
+  Clipboard*) ~/.config/sway/clip.sh ;;
+  Help*)      ~/.config/sway/help.sh ;;
+  Logout*)    ~/.config/sway/menu.sh ;;
+esac
+LAUNCH_EOF
+
+#+END_SRC
+
+* Module 12 — Sway helper: vol.sh + bright.sh
+  :PROPERTIES:
+  :CUSTOM_ID: m12-vol-bright
+  :END:
+
+  Hardware-key feedback via mako toasts, never windows. Both rely on
+  the notification replacement tag so multiple rapid presses replace
+  the toast rather than stacking.
+
+#+NAME: m12-vol-bright
+#+BEGIN_SRC bash
+cat > "$DOTFILES/sway/vol.sh" <<'VOL_EOF'
+#!/bin/sh
+case "$1" in
+  up)   wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ ;;
+  down) wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%- ;;
+  mute) wpctl set-mute   @DEFAULT_AUDIO_SINK@ toggle ;;
+esac
+VOL=$(wpctl get-volume @DEFAULT_AUDIO_SINK@)
+if printf '%s' "$VOL" | grep -q MUTED; then
+  msg="Muted"
+else
+  msg="$(printf '%s' "$VOL" | awk '{printf "%d", $2*100}')%"
+fi
+notify-send -h string:x-canonical-private-synchronous:vol -t 1200 "Volume" "$msg"
+VOL_EOF
+
+cat > "$DOTFILES/sway/bright.sh" <<'BRIGHT_EOF'
+#!/bin/sh
+case "$1" in
+  up)   brightnessctl set 5%+ >/dev/null ;;
+  down) brightnessctl set 5%- >/dev/null ;;
+esac
+pct=$(brightnessctl -m | awk -F, '{gsub(/%/,"",$4); print $4}')
+notify-send -h string:x-canonical-private-synchronous:bright -t 1200 "Brightness" "${pct}%"
+BRIGHT_EOF
+
+#+END_SRC
+
+* Module 13 — Sway helper: shot.sh + rec.sh
+  :PROPERTIES:
+  :CUSTOM_ID: m13-shot-rec
+  :END:
+
+  Screenshot and screen-record, each with a wofi mode menu.
+  - =shot.sh=: Region / Window / Full. Writes to =~/Pictures=, copies to
+    clipboard via =wl-copy=.
+  - =rec.sh=: toggles recording (press again to stop). Options for
+    Region / Full / with-audio. Writes to =~/Videos=.
+
+#+NAME: m13-shot-rec
+#+BEGIN_SRC bash
+cat > "$DOTFILES/sway/shot.sh" <<'SHOT_EOF'
+#!/bin/sh
+mkdir -p "$HOME/Pictures"
+choice=$(printf 'Region\nWindow\nFull screen' | wofi --dmenu --prompt 'Screenshot')
+ts=$(date +%Y%m%d-%H%M%S)
+out="$HOME/Pictures/shot-$ts.png"
+case "$choice" in
+  Region)
+    geom=$(slurp) || exit 0
+    grim -g "$geom" "$out" && wl-copy < "$out" ;;
+  Window)
+    geom=$(swaymsg -t get_tree | jq -r '.. | select(.focused?) | .rect | "\(.x),\(.y) \(.width)x\(.height)"')
+    grim -g "$geom" "$out" && wl-copy < "$out" ;;
+  Full*)
+    grim "$out" && wl-copy < "$out" ;;
+  *) exit 0 ;;
+esac
+notify-send -t 2000 "Screenshot" "Saved to $out"
+SHOT_EOF
+
+cat > "$DOTFILES/sway/rec.sh" <<'REC_EOF'
+#!/bin/sh
+if pgrep -x wf-recorder >/dev/null; then
+  pkill -INT wf-recorder
+  notify-send -t 2000 "Recording" "Stopped"
+  exit 0
+fi
+choice=$(printf 'Region\nFull screen\nRegion + audio\nFull + audio' | wofi --dmenu --prompt 'Record')
+[ -z "$choice" ] && exit 0
+mkdir -p "$HOME/Videos"
+out="$HOME/Videos/rec-$(date +%Y%m%d-%H%M%S).mp4"
+audio=""
+case "$choice" in *audio) audio="--audio=$(pactl get-default-sink).monitor" ;; esac
+geom=""
+case "$choice" in Region*) geom="-g $(slurp)" ;; esac
+# shellcheck disable=SC2086
+wf-recorder $geom $audio -f "$out" >/dev/null 2>&1 &
+notify-send -t 2000 "Recording" "→ $out"
+REC_EOF
+
+#+END_SRC
+
+* Module 14 — Sway helper: clip.sh + calendar.sh + toggles.sh + nmtui.sh + menu.sh
+  :PROPERTIES:
+  :CUSTOM_ID: m14-clip-cal-tog
+  :END:
+
+  - =clip.sh=: clipboard history
+  - =calendar.sh=: ncal popup
+  - =toggles.sh=: night-light and power-profile toggles
+  - =nmtui.sh=: floats foot at workspace size, waits 0.2 s, starts nmtui
+  - =menu.sh= **new** — session menu. Uses =wofi=, which is
+    D-Bus-activated and always renders on the active output. wlogout
+    is still available if invoked manually, but the bar's Menu button no
+    longer depends on it.
+
+#+NAME: m14-clip-cal-tog
+#+BEGIN_SRC bash
+cat > "$DOTFILES/sway/clip.sh" <<'CLIP_EOF'
+#!/bin/sh
+sel=$(cliphist list | wofi --dmenu --insensitive --prompt "Clipboard")
+[ -z "$sel" ] && exit 0
+printf '%s' "$sel" | cliphist decode | wl-copy
+CLIP_EOF
+
+cat > "$DOTFILES/sway/calendar.sh" <<'CAL_EOF'
+#!/bin/sh
+foot --app-id=foot-popup -T calendar -e sh -c 'ncal -3 -w; printf "\nPress Enter to close.\n"; read _'
+CAL_EOF
+
+cat > "$DOTFILES/sway/nmtui.sh" <<'NMTUI_EOF'
+#!/bin/sh
+# Float at workspace size (Module 8 rule), then wait for foot to process
+# the resize before ncurses queries the terminal dimensions. Without the
+# sleep, nmtui renders at foot's guessed initial size (top-left quadrant).
+exec foot --app-id=foot-nmtui -e sh -c 'sleep 0.2; exec nmtui'
+NMTUI_EOF
+
+cat > "$DOTFILES/sway/menu.sh" <<'MENU_EOF'
+#!/bin/sh
+# Session menu. wofi-based: always renders, no GTK layer-shell dependency.
+# wlogout is still available manually: `wlogout` in a terminal.
+choice=$(printf '%s\n' \
+  "Lock screen" \
+  "Log out" \
+  "Suspend" \
+  "Reboot" \
+  "Shut down" \
+  | wofi --dmenu --insensitive --prompt "Session")
+
+case "$choice" in
+  "Lock screen") swaylock -f -c 0a1428 ;;
+  "Log out")     swaymsg exit ;;
+  "Suspend")     systemctl suspend ;;
+  "Reboot")      systemctl reboot ;;
+  "Shut down")   systemctl poweroff ;;
+esac
+MENU_EOF
+
+cat > "$DOTFILES/sway/toggles.sh" <<'TOG_EOF'
+#!/bin/sh
+case "$1" in
+  night)
+    if pgrep -x gammastep >/dev/null; then
+      pkill -x gammastep
+      notify-send -t 1500 "Night light" "Off"
+    else
+      gammastep -O 3500 >/dev/null 2>&1 &
+      notify-send -t 1500 "Night light" "On (3500K)"
+    fi
+    ;;
+  night-state)
+    pgrep -x gammastep >/dev/null && echo '{"class":"active"}' || echo '{"class":"inactive"}'
+    ;;
+  power)
+    if ! command -v powerprofilesctl >/dev/null 2>&1; then
+      notify-send -t 2500 "Power" "power-profiles-daemon not installed"
+      exit 0
+    fi
+    cur=$(powerprofilesctl get 2>/dev/null)
+    if [ "$cur" = "power-saver" ]; then
+      powerprofilesctl set balanced >/dev/null 2>&1 \
+        && notify-send -t 1500 "Power" "Balanced"
+    else
+      powerprofilesctl set power-saver >/dev/null 2>&1 \
+        && notify-send -t 1500 "Power" "Power saver"
+    fi
+    ;;
+  power-state)
+    if ! command -v powerprofilesctl >/dev/null 2>&1; then
+      echo '{"text":" ❓","class":"inactive","tooltip":"power-profiles-daemon not available"}'
+      exit 0
+    fi
+    case "$(powerprofilesctl get 2>/dev/null)" in
+      power-saver) echo '{"text":" 🔋 Saver","class":"active","tooltip":"Power saver — click to switch"}';;
+      balanced)    echo '{"text":" ⚡ Bal","class":"inactive","tooltip":"Balanced — click to switch"}';;
+      performance) echo '{"text":" 🚀 Perf","class":"perf","tooltip":"Performance — click to switch"}';;
+      *)           echo '{"text":" ❓","class":"inactive","tooltip":"Unknown"}';;
+    esac
+    ;;
+esac
+TOG_EOF
+
+#+END_SRC
+
+* Module 15 — Waybar config
+  :PROPERTIES:
+  :CUSTOM_ID: m15-waybar-config
+  :END:
+
+  Text labels, not icons — click targets are the primary affordance.
+
+  **Clock fix:** ={:%a %H:%M} · {:%b %d}= uses =%a= and =%b=, which are
+  locale-dependent. On a fresh install without a generated locale,
+  =strftime= returns empty strings for those specifiers and the clock
+  renders as literal " · " — invisible on the bar. Switched to
+  locale-safe ={:%H:%M}  {:%d/%m}=, which uses only numeric specifiers
+  and always renders.
+
+  **Menu fix:** =custom/menu= calls =~/.config/sway/menu.sh= (wofi-based
+  session menu) instead of wlogout, which can silently fail to render
+  under some sway/GTK-layer-shell combinations.
+
+#+NAME: m15-waybar-config
+#+BEGIN_SRC bash
+cat > "$DOTFILES/waybar/config" <<'WBAR_EOF'
+{
+  "layer": "top",
+  "position": "top",
+  "height": 34,
+  "spacing": 8,
+  "margin-top": 6,
+  "margin-left": 6,
+  "margin-right": 6,
+  "modules-left":   ["sway/workspaces", "sway/mode"],
+  "modules-center": ["clock"],
+  "modules-right":  ["custom/apps","custom/help","network","pulseaudio",
+                     "bluetooth","custom/power","backlight","custom/night",
+                     "custom/rec","battery","tray","custom/menu"],
+
+  "sway/workspaces": { "disable-scroll": true, "all-outputs": true, "format": "{name}" },
+
+  "clock": {
+    "format": " {:%H:%M}  {:%d/%m}",
+    "tooltip-format": "{:%Y-%m-%d}",
+    "on-click": "~/.config/sway/calendar.sh"
+  },
+
+  "custom/apps":  { "format": " Apps", "tooltip": false,
+                    "on-click": "wofi --show drun --insensitive" },
+  "custom/help":  { "format": " Help", "tooltip": false,
+                    "on-click": "~/.config/sway/help.sh" },
+  "custom/night": { "format": " Night", "tooltip": false,
+                    "exec": "~/.config/sway/toggles.sh night-state",
+                    "interval": 5,
+                    "on-click": "~/.config/sway/toggles.sh night" },
+  "custom/rec":   { "format": " Rec", "tooltip": false,
+                    "exec": "pgrep -x wf-recorder >/dev/null && echo '{\"class\":\"active\"}' || echo '{\"class\":\"inactive\"}'",
+                    "interval": 2,
+                    "on-click": "~/.config/sway/rec.sh" },
+  "custom/power": { "format": "{}", "tooltip": false,
+                    "return-type": "json",
+                    "exec": "~/.config/sway/toggles.sh power-state",
+                    "interval": 10,
+                    "on-click": "~/.config/sway/toggles.sh power" },
+  "custom/menu":  { "format": " Menu", "tooltip": false,
+                    "on-click": "~/.config/sway/menu.sh" },
+
+  "backlight": {
+    "format": "☀ {percent}%",
+    "interval": 2,
+    "on-scroll-up": "brightnessctl set 5%+",
+    "on-scroll-down": "brightnessctl set 5%-"
+  },
+
+  "network": {
+    "format-wifi": "Wi-Fi {essid}",
+    "format-ethernet": "Wired",
+    "format-disconnected": "Offline",
+    "tooltip-format": "{ifname}: {ipaddr}",
+    "on-click": "~/.config/sway/nmtui.sh"
+  },
+  "pulseaudio": {
+    "format": "Vol {volume}%",
+    "format-muted": "Muted",
+    "on-click": "foot --app-id=foot-tui -e pulsemixer",
+    "on-scroll-up": "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+",
+    "on-scroll-down": "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"
+  },
+  "bluetooth": {
+    "format": "BT",
+    "format-disabled": "BT off",
+    "format-connected": "BT {num_connections}",
+    "tooltip-format": "{controller_alias}\n{controller_address}",
+    "on-click": "blueman-manager"
+  },
+  "battery": {
+    "format": "{capacity}%",
+    "format-charging": "{capacity}% ↑",
+    "states": { "warning": 20, "critical": 10 }
+  },
+  "tray": { "spacing": 8 }
+}
+WBAR_EOF
+
+#+END_SRCq
+
+* Module 16 — Waybar style.css (TARDIS palette)
+  :PROPERTIES:
+  :CUSTOM_ID: m16-waybar-style
+  :END:
+
+  **New since v1:** =#custom-power= and =#backlight= share the same pill
+  styling as the other click targets. =#custom-power.active= (power
+  saver on) uses yellow, matching =#custom-night.active=. =#custom-power.perf=
+  uses red so performance mode is impossible to miss.
+
+#+NAME: m16-waybar-style
+#+BEGIN_SRC bash
+cat > "$DOTFILES/waybar/style.css" <<'WBARCSS_EOF'
+@define-color base   #0a1428;
+@define-color mantle #0d1e33;
+@define-color crust  #071426;
+@define-color text   #cdd6f4;
+@define-color subtext#8899bb;
+@define-color tardis #0F5CA8;
+@define-color glow   #4A9FE0;
+@define-color deep   #003B6F;
+@define-color red    #f38ba8;
+@define-color yellow #f9e2af;
+
+* {
+  font-family: "JetBrains Mono", "Font Awesome 6 Free", sans-serif;
+  font-size: 13px;
+  min-height: 0; border: none; border-radius: 0;
+}
+window#waybar { background: transparent; color: @text; }
+.modules-left, .modules-center, .modules-right {
+  background: @mantle; border-radius: 10px; padding: 0 6px;
+}
+#workspaces button {
+  padding: 0 10px; color: @subtext; background: transparent;
+  border-radius: 8px; margin: 4px 2px;
+}
+#workspaces button.focused,
+#workspaces button.active { background: @tardis; color: @crust; }
+#workspaces button:hover { background: @deep; color: @glow; }
+#clock { padding: 0 14px; font-weight: 600; color: @glow; }
+#custom-apps, #custom-help, #custom-menu,
+#network, #pulseaudio, #bluetooth,
+#custom-night, #custom-rec, #custom-power, #backlight, #battery {
+  padding: 0 12px; margin: 4px 2px; border-radius: 8px; background: @crust;
+}
+#custom-apps:hover, #custom-help:hover, #custom-menu:hover,
+#network:hover, #pulseaudio:hover, #bluetooth:hover,
+#custom-night:hover, #custom-rec:hover, #custom-power:hover,
+#backlight:hover, #battery:hover {
+  background: @deep; color: @glow;
+}
+#custom-night.active  { background: @yellow; color: @crust; }
+#custom-rec.active    { background: @red;    color: @crust; }
+#custom-power.active  { background: @yellow; color: @crust; }
+#custom-power.perf    { background: @red;    color: @crust; }
+#battery.warning  { color: @yellow; }
+#battery.critical { color: @red;    }
+tooltip { background: @mantle; border: 1px solid @glow; border-radius: 8px; }
+tooltip label { color: @text; padding: 6px; }
+WBARCSS_EOF
+
+#+END_SRC
+
+* Module 17 — Mako notification config
+  :PROPERTIES:
+  :CUSTOM_ID: m17-mako
+  :END:
+
+#+NAME: m17-mako
+#+BEGIN_SRC bash
+cat > "$DOTFILES/mako/config" <<'MAKO_EOF'
+font=JetBrains Mono 11
+width=380
+height=140
+margin=12
+padding=12
+border-size=2
+border-radius=10
+border-color=#4A9FE0
+background-color=#0a1428cc
+text-color=#cdd6f4
+progress-color=over #f38ba8cc
+default-timeout=6000
+anchor=top-right
+icons=1
+max-visible=4
+layer=overlay
+MAKO_EOF
+
+#+END_SRC
+
+* Module 18 — Foot terminal config
+  :PROPERTIES:
+  :CUSTOM_ID: m18-foot
+  :END:
+
+#+NAME: m18-foot
+#+BEGIN_SRC bash
+cat > "$DOTFILES/foot/foot.ini" <<'FOOT_EOF'
+[main]
+font=JetBrains Mono:size=12
+pad=10x10
+dpi-aware=no
+selection-clipboard=clipboard
+
+[colors]
+background=0a1428
+foreground=cdd6f4
+regular0=1a2740
+regular1=f38ba8
+regular2=a6e3a1
+regular3=f9e2af
+regular4=0F5CA8
+regular5=c7a7ff
+regular6=94e2d5
+regular7=bac2de
+bright0=2a3a5a
+bright1=f38ba8
+bright2=a6e3a1
+bright3=f9e2af
+bright4=4A9FE0
+bright5=c7a7ff
+bright6=94e2d5
+bright7=a6adc8
+
+[cursor]
+color=0a1428 4A9FE0
+FOOT_EOF
+
+#+END_SRC
+
+* Module 19 — Wofi (launcher) config + style
+  :PROPERTIES:
+  :CUSTOM_ID: m19-wofi
+  :END:
+
+#+NAME: m19-wofi
+#+BEGIN_SRC bash
+cat > "$DOTFILES/wofi/config" <<'WOFI_EOF'
+show=drun
+insensitive=true
+allow_images=true
+image_size=24
+width=520
+height=420
+prompt=Search
+hide_scroll=true
+term=foot
+WOFI_EOF
+
+cat > "$DOTFILES/wofi/style.css" <<'WOFICSS_EOF'
+window {
+  background: #0d1e33;
+  border: 2px solid #4A9FE0;
+  border-radius: 12px;
+  font-family: "JetBrains Mono", sans-serif;
+  font-size: 14px;
+}
+#input {
+  margin: 10px; padding: 8px; border-radius: 8px; border: none;
+  background: #0a1428; color: #cdd6f4;
+}
+#entry { padding: 8px 12px; border-radius: 8px; color: #cdd6f4; }
+#entry:selected { background: #0F5CA8; color: #ffffff; }
+WOFICSS_EOF
+
+#+END_SRC
+
+* Module 20 — Wlogout layout + style
+  :PROPERTIES:
+  :CUSTOM_ID: m20-wlogout
+  :END:
+
+  Big labeled buttons: Lock, Logout, Suspend, Reboot, Shutdown. This is
+  the "how do I leave" surface for a first-time user.
+
+#+NAME: m20-wlogout
+#+BEGIN_SRC bash
+cat > "$DOTFILES/wlogout/layout" <<'WLO_EOF'
+[
+  { "label": "Lock",     "action": "swaylock -f -c 0a1428", "keybind": "l" },
+  { "label": "Logout",   "action": "swaymsg exit",           "keybind": "e" },
+  { "label": "Suspend",  "action": "systemctl suspend",      "keybind": "s" },
+  { "label": "Reboot",   "action": "systemctl reboot",       "keybind": "r" },
+  { "label": "Shutdown", "action": "systemctl poweroff",     "keybind": "p" }
+]
+WLO_EOF
+
+cat > "$DOTFILES/wlogout/style.css" <<'WLOCSS_EOF'
+* { background: transparent; }
+window { background: rgba(7, 20, 38, 0.85); font-family: "JetBrains Mono", sans-serif; }
+button {
+  margin: 12px; padding: 24px 12px; border-radius: 12px; background: #0a1428;
+  border: 2px solid #003B6F; color: #cdd6f4; font-size: 16px;
+}
+button:hover, button:focus {
+  background: #0F5CA8; color: #ffffff; border-color: #4A9FE0;
+}
+label { font-size: 16px; }
+WLOCSS_EOF
+
+#+END_SRC
+
+* Module 21 — Gammastep + Kanshi configs
+  :PROPERTIES:
+  :CUSTOM_ID: m21-gam-kan
+  :END:
+
+  Gammastep: manual location (toggled to 3500K by =toggles.sh=).
+  Kanshi: permissive default profile (adjust manually per monitor).
+
+#+NAME: m21-gam-kan
+#+BEGIN_SRC bash
+cat > "$DOTFILES/gammastep/config.ini" <<'GAM_EOF'
+[general]
+location-provider=manual
+adjustment-method=wayland
+
+[manual]
+lat=0.0
+lon=0.0
+GAM_EOF
+
+cat > "$DOTFILES/kanshi/config" <<'KAN_EOF'
+profile default {
+  output * enable
+  output * scale 1
+}
+KAN_EOF
+
+#+END_SRC
+
+* Module 22 — TARDIS-blue wallpaper
+  :PROPERTIES:
+  :CUSTOM_ID: m22-wallpaper
+  :END:
+
+  Pure Python gradient, no ImageMagick dependency. Guarded by existence
+  check so re-running preserves any wallpaper the user replaced.
+
+#+NAME: m22-wallpaper
+#+BEGIN_SRC bash
+if [ ! -f "$DOTFILES/wallpapers/current.ppm" ]; then
+  log "Generating TARDIS-blue wallpaper…"
+  python3 - "$DOTFILES/wallpapers/current.ppm" <<'PY_EOF'
+import sys
+w, h = 1920, 1080
+top = (0x00, 0x14, 0x30)
+bot = (0x00, 0x3B, 0x6F)
+buf = bytearray(b'P6\n%d %d\n255\n' % (w, h))
+for y in range(h):
+    t = y / (h - 1)
+    r = int(top[0] + (bot[0] - top[0]) * t)
+    g = int(top[1] + (bot[1] - top[1]) * t)
+    b = int(top[2] + (bot[2] - top[2]) * t)
+    buf.extend(bytes((r, g, b)) * w)
+open(sys.argv[1], 'wb').write(buf)
+PY_EOF
+fi
+
+#+END_SRC
+
+* Module 23 — Resolve polkit binary path
+  :PROPERTIES:
+  :CUSTOM_ID: m23-polkit-bin
+  :END:
+
+  Finds the actual authentication-agent binary on disk and substitutes
+  =__POLKIT__= inside the sway config written by Module 8. If nothing
+  is found, deletes the =exec __POLKIT__= line rather than leaving a
+  broken exec.
+
+  **Invariant:** must run AFTER Module 8.
+
+#+NAME: m23-polkit-bin
+#+BEGIN_SRC bash
+POLKIT=""
+for p in \
+  /usr/bin/lxpolkit \
+  /usr/libexec/lxpolkit \
+  /usr/libexec/polkit-gnome-authentication-agent-1 \
+  /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1 \
+  /usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1 \
+  /usr/lib/mate-polkit/polkit-mate-authentication-agent-1 \
+  /usr/lib/x86_64-linux-gnu/libexec/polkit-mate-authentication-agent-1 ; do
+  if [ -x "$p" ]; then POLKIT="$p"; break; fi
+done
+
+if [ -z "$POLKIT" ]; then
+  warn "No polkit authentication agent found on disk."
+  sed -i '/__POLKIT__/d' "$DOTFILES/sway/config"
+else
+  log "Polkit agent: $POLKIT"
+  sed -i "s|__POLKIT__|$POLKIT|" "$DOTFILES/sway/config"
+fi
+
+#+END_SRC
+
+* Module 24 — Make scripts executable + self-copy
+  :PROPERTIES:
+  :CUSTOM_ID: m24-chmod
+  :END:
+
+  Sets execute bits on all =~/dotfiles/sway/*.sh= and copies this
+  installer into =~/dotfiles/= for reference.
+
+#+NAME: m24-chmod
+#+BEGIN_SRC bash
+chmod +x "$DOTFILES"/sway/*.sh
+cp "$0" "$DOTFILES/install.sh" 2>/dev/null || true
+chmod +x "$DOTFILES/install.sh" 2>/dev/null || true
+
+#+END_SRC
+
+* Module 25 — Symlink configs into ~/.config
+  :PROPERTIES:
+  :CUSTOM_ID: m25-symlink
+  :END:
+
+  =backup_if_real= only backs up a *real* directory (never a symlink),
+  so re-runs don't accumulate =~/.config/sway.bak-…= dirs.
+
+#+NAME: m25-symlink
+#+BEGIN_SRC bash
+backup_if_real() {
+  local t="$1"
+  if [ -e "$t" ] && [ ! -L "$t" ]; then
+    local b="$t.bak-$(date +%s)"
+    warn "Backing up $t → $b"
+    mv "$t" "$b"
+  fi
+}
+
+log "Linking configs into $CONFIG…"
+for d in sway waybar mako foot wofi wlogout gammastep kanshi; do
+  backup_if_real "$CONFIG/$d"
+  ln -sfn "$DOTFILES/$d" "$CONFIG/$d"
+done
+backup_if_real "$HOME/wallpapers"
+ln -sfn "$DOTFILES/wallpapers" "$HOME/wallpapers"
+
+#+END_SRC
+
+* Module 26 — Hard verification gate
+  :PROPERTIES:
+  :CUSTOM_ID: m26-verify
+  :END:
+
+  Refuses to declare success unless:
+  - polkit binary exists on disk
+  - sway config contains the substituted =exec /…polkit= line
+  - a file manager exists (=nnn= or =yazi=)
+  - =files.sh= and =help.sh= are executable
+
+  Failure = exit 1 with a message pointing at exactly what's wrong.
+  This is the last line of defense against a broken desktop.
+
+#+NAME: m26-verify
+#+BEGIN_SRC bash
+ERRS=""
+[ -z "$POLKIT" ] || [ ! -x "$POLKIT" ] && ERRS="${ERRS}· no working polkit agent\n"
+grep -qE '^exec /.*(polkit|lxpolkit)' "$DOTFILES/sway/config" 2>/dev/null \
+  || ERRS="${ERRS}· sway config has no polkit exec line\n"
+{ command -v nnn >/dev/null 2>&1 || command -v yazi >/dev/null 2>&1; } \
+  || ERRS="${ERRS}· no file manager (nnn or yazi)\n"
+[ -x "$DOTFILES/sway/files.sh" ] || ERRS="${ERRS}· files.sh not executable\n"
+[ -x "$DOTFILES/sway/help.sh" ]  || ERRS="${ERRS}· help.sh not executable\n"
+
+if [ -n "$ERRS" ]; then
+  warn "Install verification FAILED:"
+  printf "$ERRS" >&2
+  warn "Do NOT log out into Sway until these are resolved."
+  exit 1
+fi
+
+if [ ! -f /usr/share/wayland-sessions/sway.desktop ]; then
+  warn "/usr/share/wayland-sessions/sway.desktop not found; your DM may not list Sway."
+fi
+
+if ! sudo dpkg --audit 2>/dev/null | grep -q .; then
+  :
+else
+  warn "dpkg still has half-configured packages. The desktop will work,"
+  warn "but 'sudo apt install …' will keep failing until you fix them, e.g.:"
+  warn "  sudo apt remove --purge virtualbox-dkms   # if you don't need VBox"
+  warn "  sudo apt install --reinstall virtualbox-dkms  # to rebuild it"
+fi
+
+log "Verified: polkit agent = $POLKIT"
+if command -v yazi >/dev/null 2>&1; then
+  log "Verified: file manager = yazi (nnn also present)"
+else
+  log "Verified: file manager = nnn"
+fi
+
+#+END_SRC
+
+* Module 27 — Final message
+  :PROPERTIES:
+  :CUSTOM_ID: m27-final
+  :END:
+
+#+NAME: m27-final
+#+BEGIN_SRC bash
+cat <<MSG_EOF
+
+  ✓ Install complete and verified.
+
+  Log out. At the login screen, pick "Sway".
+
+  First-run orientation:
+    • Bar is the menu: Apps · Help · Wi-Fi · Vol · BT · Night · Rec · Menu
+    • Super+A   → every tool in one menu
+    • Super+/   → every shortcut (generated live from sway/config)
+    • Super+E   → files (yazi if installed, else nnn)
+    • Super+Shift+Q → wlogout (lock / suspend / reboot / shutdown)
+    • Volume / brightness keys → blue mako toast, never a window
+
+  Install log: $LOG
+
+MSG_EOF
+
+#+END_SRC
